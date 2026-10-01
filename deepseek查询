@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+# ============================================================
+# create_project.sh
+# 一键生成「DeepSeek 余额」Android 工程（Kotlin + Compose + Glance 小组件）
+# 用法:  bash create_project.sh [目标目录]     默认生成到当前目录
+# ============================================================
+set -euo pipefail
+
+ROOT="${1:-.}"
+mkdir -p "$ROOT"
+
+wf() {
+  local path="$ROOT/$1"
+  mkdir -p "$(dirname "$path")"
+  cat > "$path"
+  echo "  ✓ $1"
+}
+
+echo "开始生成工程到: $ROOT"
+
+# ---------- Gradle 配置 ----------
+
+wf "settings.gradle.kts" <<'EOF_SETTINGS'
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositories { google(); mavenCentral() }
+}
+rootProject.name = "DeepSeekBalance"
+include(":app")
+EOF_SETTINGS
+
+wf "build.gradle.kts" <<'EOF_ROOT_GRADLE'
+plugins {
+    id("com.android.application") version "8.5.2" apply false
+    id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+    id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+}
+EOF_ROOT_GRADLE
+
+wf "gradle.properties" <<'EOF_GRADLE_PROPS'
+org.gradle.jvmargs=-Xmx2048m
+android.useAndroidX=true
+kotlin.code.style=official
+EOF_GRADLE_PROPS
+
+wf ".gitignore" <<'EOF_GITIGNORE'
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+captures/
+EOF_GITIGNORE
+
+wf "app/build.gradle.kts" <<'EOF_APP_GRADLE'
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+android {
+    namespace = "com.example.deepseekbalance"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.example.deepseekbalance"
+        minSdk = 24
+        targetSdk = 34
+        versionCode = 1
+        versionName = "1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = "17" }
+    buildFeatures { compose = true }
+}
+
+dependencies {
+    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    implementation("androidx.glance:glance-appwidget:1.1.1")
+}
+EOF_APP_GRADLE
+
+wf "app/proguard-rules.pro" <<'EOF_PROGUARD'
+# 保持默认即可
+EOF_PROGUARD
+
+# ---------- Manifest 与资源 ----------
+
+wf "app/src/main/AndroidManifest.xml" <<'EOF_MANIFEST'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DeepSeekBalance">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 桌面小组件 -->
+        <receiver
+            android:name=".widget.BalanceWidgetReceiver"
+            android:exported="false"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/balance_widget_info" />
+        </receiver>
+    </application>
+</manifest>
+EOF_MANIFEST
+
+wf "app/src/main/res/values/strings.xml" <<'EOF_STRINGS'
+<resources>
+    <string name="app_name">DeepSeek 余额</string>
+    <string name="widget_description">显示 DeepSeek 账户余额</string>
+</resources>
+EOF_STRINGS
+
+wf "app/src/main/res/values/themes.xml" <<'EOF_THEMES'
+<resources>
+    <style name="Theme.DeepSeekBalance" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
+EOF_THEMES
+
+wf "app/src/main/res/xml/balance_widget_info.xml" <<'EOF_WIDGET_INFO'
+<?xml version="1.0" encoding="utf-8"?>
+<appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/widget_description"
+    android:initialLayout="@layout/glance_default_loading_layout"
+    android:minWidth="180dp"
+    android:minHeight="110dp"
+    android:resizeMode="horizontal|vertical"
+    android:targetCellWidth="3"
+    android:targetCellHeight="2"
+    android:updatePeriodMillis="1800000"
+    android:widgetCategory="home_screen" />
+EOF_WIDGET_INFO
+
+# ---------- Kotlin 源码 ----------
+
+wf "app/src/main/java/com/example/deepseekbalance/DeepSeekApi.kt" <<'EOF_API'
+package com.example.deepseekbalance
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+
+data class BalanceInfo(
+    val currency: String,
+    val totalBalance: String,
+    val grantedBalance: String,
+    val toppedUpBalance: String
+)
+
+data class BalanceResult(
+    val isAvailable: Boolean,
+    val infos: List<BalanceInfo>
+)
+
+object DeepSeekApi {
+
+    private const val ENDPOINT = "https://api.deepseek.com/user/balance"
+
+    suspend fun fetchBalance(apiKey: String): BalanceResult = withContext(Dispatchers.IO) {
+        val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 15_000
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("Authorization", "Bearer $apiKey")
+        }
+        try {
+            val code = conn.responseCode
+            val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() }.orEmpty()
+
+            if (code !in 200..299) {
+                val msg = runCatching {
+                    JSONObject(body).optJSONObject("error")?.optString("message")
+                }.getOrNull().orEmpty()
+                throw IllegalStateException(
+                    if (code == 401) "API Key 无效或已过期（401）"
+                    else "请求失败：HTTP $code${if (msg.isNotBlank()) " · $msg" else ""}"
+                )
+            }
+
+            val json = JSONObject(body)
+            val arr = json.optJSONArray("balance_infos")
+            val infos = buildList {
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        val o = arr.getJSONObject(i)
+                        add(
+                            BalanceInfo(
+                                currency = o.optString("currency", "CNY"),
+                                totalBalance = o.optString("total_balance", "-"),
+                                grantedBalance = o.optString("granted_balance", "-"),
+                                toppedUpBalance = o.optString("topped_up_balance", "-")
+                            )
+                        )
+                    }
+                }
+            }
+            BalanceResult(json.optBoolean("is_available", false), infos)
+
+        } catch (e: java.io.IOException) {
+            throw IllegalStateException("网络异常：${e.message ?: "请检查网络连接"}")
+        } finally {
+            conn.disconnect()
+        }
+    }
+}
+EOF_API
+
+wf "app/src/main/java/com/example/deepseekbalance/Prefs.kt" <<'EOF_PREFS'
+package com.example.deepseekbalance
+
+import android.content.Context
+import android.content.SharedPreferences
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+
+class Prefs(context: Context) {
+
+    private val prefs: SharedPreferences =
+        instance ?: create(context.applicationContext).also { instance = it }
+
+    var apiKey: String
+        get() = prefs.getString(KEY_API, "").orEmpty()
+        set(value) { prefs.edit().putString(KEY_API, value).apply() }
+
+    var apiKey: String
+        get() = prefs.getString(KEY_API, "").orEmpty()
+        set(value) { prefs.edit().putString(KEY_API, value).apply() }
+
+    private companion object {
+        const val KEY_API = "api_key"
+        const val FILE = "deepseek_balance"
+        const val PLAIN_FILE = "deepseek_balance_plain"
+
+        @Volatile
+        var instance: SharedPreferences? = null
+
+        fun create(context: Context): SharedPreferences = runCatching {
+            val masterKey = MasterKey.Builder(context)
+                .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
+                .build()
+            EncryptedSharedPreferences.create(
+                context,
+                FILE,
+                masterKey,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            ) as SharedPreferences
+        }.getOrElse {
+            context.getSharedPreferences(PLAIN_FILE, Context.MODE_PRIVATE)
+        }
+    }
+}
+EOF_PREFS
+
+wf "app/src/main/java/com/example/deepseekbalance/BalanceViewModel.kt" <<'EOF_VM'
+package com.example.deepseekbalance
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.deepseekbalance.widget.updateBalanceWidgets
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+sealed interface BalanceState {
+    data object Idle : BalanceState
+    data object Loading : BalanceState
+    data class Success(val result: BalanceResult) : BalanceState
+    data class Error(val message: String) : BalanceState
+}
+
+data class BalanceUiState(
+    val apiKey: String = "",
+    val state: BalanceState = BalanceState.Idle,
+    val lastUpdated: Long? = null
+) {
+    val hasKey: Boolean get() = apiKey.isNotBlank()
+}
+
+class BalanceViewModel(app: Application) : AndroidViewModel(app) {
+
+    private val prefs = Prefs(app)
+    private val _uiState = MutableStateFlow(BalanceUiState(apiKey = prefs.apiKey))
+    val uiState: StateFlow<BalanceUiState> = _uiState.asStateFlow()
+    private var job: Job? = null
+
+    init {
+        if (prefs.apiKey.isNotBlank()) refresh()
+    }
+
+    fun saveApiKey(key: String) {
+        val trimmed = key.trim()
+        prefs.apiKey = trimmed
+        _uiState.update { it.copy(apiKey = trimmed) }
+        refresh()
+    }
+
+    fun clearApiKey() {
+        job?.cancel()
+        prefs.apiKey = ""
+        _uiState.value = BalanceUiState()
+        viewModelScope.launch { updateBalanceWidgets(getApplication()) }
+    }
+
+    fun refresh() {
+        val key = _uiState.value.apiKey
+        if (key.isBlank()) return
+        job?.cancel()
+        _uiState.update { it.copy(state = BalanceState.Loading) }
+        job = viewModelScope.launch {
+            try {
+                val result = DeepSeekApi.fetchBalance(key)
+                _uiState.update {
+                    it.copy(state = BalanceState.Success(result), lastUpdated = System.currentTimeMillis())
+                }
+                updateBalanceWidgets(getApplication())
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (t: Throwable) {
+                _uiState.update { it.copy(state = BalanceState.Error(t.message ?: "未知错误")) }
+                updateBalanceWidgets(getApplication())
+            }
+        }
+    }
+}
+EOF_VM
+
+wf "app/src/main/java/com/example/deepseekbalance/MainActivity.kt" <<'EOF_MAIN'
+package com.example.deepseekbalance
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            DeepSeekBalanceTheme {
+                val vm: BalanceViewModel = viewModel()
+                val uiState by vm.uiState.collectAsStateWithLifecycle()
+                BalanceScreen(
+                    state = uiState,
+                    onSaveKey = vm::saveApiKey,
+                    onRefresh = vm::refresh,
+                    onClearKey = vm::clearApiKey
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun DeepSeekBalanceTheme(content: @Composable () -> Unit) {
+    val scheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()
+    MaterialTheme(colorScheme = scheme, content = content)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BalanceScreen(
+    state: BalanceUiState,
+    onSaveKey: (String) -> Unit,
+    onRefresh: () -> Unit,
+    onClearKey: () -> Unit
+) {
+    var editing by rememberSaveable { mutableStateOf(false) }
+    val showKeyInput = !state.hasKey || editing
+    val busy = state.state is BalanceState.Loading
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("DeepSeek 余额") },
+                actions = {
+                    if (state.hasKey && !showKeyInput) {
+                        IconButton(onClick = onRefresh, enabled = !busy) {
+                            Icon(Icons.Default.Refresh, contentDescription = "刷新")
+                        }
+                        IconButton(onClick = { editing = true }) {
+                            Icon(Icons.Default.Settings, contentDescription = "设置")
+                        }
+                    }
+                }
+            )
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            if (showKeyInput) {
+                ApiKeyCard(
+                    initialKey = state.apiKey,
+                    canCancel = state.hasKey,
+                    onCancel = { editing = false },
+                    onSave = { key -> onSaveKey(key); editing = false }
+                )
+                if (state.hasKey) {
+                    TextButton(onClick = { onClearKey(); editing = false }) {
+                        Text("清除已保存的 API Key")
+                    }
+                }
+            } else {
+                BalanceBody(state = state, onRefresh = onRefresh)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BalanceBody(state: BalanceUiState, onRefresh: () -> Unit) {
+    if (state.state is BalanceState.Loading) {
+        LinearProgressIndicator(Modifier.fillMaxWidth())
+    }
+
+    when (val s = state.state) {
+        is BalanceState.Error -> Card(
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.errorContainer
+            )
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "获取失败",
+                    fontWeight = FontWeight.Bold,
+                    color = 
+MaterialTheme.colorScheme.onErrorContainer
+                )
+                Text(
+                    s.message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
+                Button(onClick = onRefresh) { Text("重试") }
+            }
+        }
+
+        is BalanceState.Success -> {
+            if (s.result.infos.isEmpty()) {
+                Text("接口未返回余额信息")
+            }
+            s.result.infos.forEach { BalanceCard(it) }
+            AssistChip(
+                onClick = { },
+                label = { Text(if (s.result.isAvailable) "账户状态：可用" else "账户状态：不可用") }
+            )
+        }
+
+        BalanceState.Idle -> Text("尚未查询，点击右上角刷新")
+        BalanceState.Loading -> { }
+    }
+
+    state.lastUpdated?.let {
+        Text(
+            "最近更新：${SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(it))}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun BalanceCard(info: BalanceInfo) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(
+                "总余额（${info.currency}）",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(info.totalBalance, fontSize = 40.sp, fontWeight = FontWeight.Bold)
+
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("赠送余额", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(info.grantedBalance)
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("充值余额", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(info.toppedUpBalance)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ApiKeyCard(
+    initialKey: String,
+    canCancel: Boolean,
+    onCancel: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var text by rememberSaveable { mutableStateOf(initialKey) }
+    var visible by rememberSaveable { mutableStateOf(false) }
+
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text(
+                "填入 DeepSeek API Key",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold
+            )
+
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("API Key") },
+                placeholder = { Text("sk-...") },
+                singleLine = true,
+                visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                trailingIcon = {
+                    TextButton(onClick = { visible = !visible }) {
+                        Text(if (visible) "隐藏" else "显示")
+                    }
+                }
+            )
+
+            Text(
+                "Key 仅加密保存在本机，用于请求 api.deepseek.com/user/balance，不会上传到其他服务器。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(onClick = { onSave(text.trim()) }, enabled = text.trim().length > 8) {
+                    Text("保存并查询")
+                }
+                if (canCancel) {
+                    TextButton(onClick = onCancel) { Text("取消") }
+                }
+            }
+        }
+    }
+}
+EOF_MAIN
+
+wf "app/src/main/java/com/example/deepseekbalance/widget/BalanceWidget.kt" <<'EOF_WIDGET'
+package com.example.deepseekbalance.widget
+
+import android.content.Context
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.glance.GlanceId
+import androidx.glance.GlanceModifier
+import androidx.glance.action.clickable
+import androidx.glance.appwidget.GlanceAppWidget
+import androidx.glance.appwidget.GlanceAppWidgetReceiver
+import androidx.glance.appwidget.action.ActionCallback
+import androidx.glance.appwidget.action.ActionParameters
+import androidx.glance.appwidget.action.actionRunCallback
+import androidx.glance.appwidget.action.actionStartActivity
+import androidx.glance.appwidget.cornerRadius
+import androidx.glance.appwidget.provideContent
+import androidx.glance.appwidget.update
+import androidx.glance.appwidget.updateAll
+import androidx.glance.background
+import androidx.glance.layout.Alignment
+import androidx.glance.layout.Column
+import androidx.glance.layout.Spacer
+import androidx.glance.layout.fillMaxSize
+import androidx.glance.layout.height
+import androidx.glance.layout.padding
+import androidx.glance.text.FontWeight
+import androidx.glance.text.Text
+import androidx.glance.text.TextStyle
+import androidx.glance.unit.ColorProvider
+import com.example.deepseekbalance.BalanceInfo
+import com.example.deepseekbalance.DeepSeekApi
+import com.example.deepseekbalance.MainActivity
+import com.example.deepseekbalance.Prefs
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/* ---------- 配色 ---------- */
+
+private val CardBg = ColorProvider(Color(0xFFF4F5F7), Color(0xFF1C1C1E))
+private val TitleColor = ColorProvider(Color(0xFF6B7280), Color(0xFF9AA0A6))
+private val MainColor = ColorProvider(Color(0xFF111827), Color(0xFFF3F4F6))
+private val SubColor = ColorProvider(Color(0xFF6B7280), Color(0xFF9AA0A6))
+private val ErrColor = ColorProvider(Color(0xFFB3261E), Color(0xFFFFB4AB))
+private val AccentColor = ColorProvider(Color(0xFF2D6CDF), Color(0xFF3B6FD4))
+private val OnAccent = ColorProvider(Color.White, Color.White)
+
+/* ---------- 数据状态 ---------- */
+
+private sealed interface WidgetData {
+    data class Ok(
+        val isAvailable: Boolean,
+        val infos: List<BalanceInfo>,
+        val updatedAt: Long
+    ) : WidgetData
+
+    data class Err(val message: String) : WidgetData
+    data object NoKey : WidgetData
+}
+
+private suspend fun loadData(context: Context): WidgetData {
+    val key = Prefs(context).apiKey
+    if (key.isBlank()) return WidgetData.NoKey
+    return try {
+        val r = DeepSeekApi.fetchBalance(key)
+        WidgetData.Ok(r.isAvailable, r.infos, System.currentTimeMillis())
+    } catch (t: Throwable) {
+        WidgetData.Err(t.message ?: "未知错误")
+    }
+}
+
+private fun time(ts: Long) =
+    SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(ts))
+
+/* ---------- 小组件本体 ---------- */
+
+class BalanceWidget : GlanceAppWidget() {
+
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        val data = loadData(context)
+        provideContent { WidgetContent(data) }
+    }
+}
+
+class BalanceWidgetReceiver : GlanceAppWidgetReceiver() {
+    override val glanceAppWidget: GlanceAppWidget = BalanceWidget()
+}
+
+/** 点击「刷新」：重新拉取并重绘本组件 */
+class RefreshAction : ActionCallback {
+    override suspend fun onAction(
+        context: Context,
+        glanceId: GlanceId,
+        parameters: ActionParameters
+    ) {
+        BalanceWidget().update(context, glanceId)
+    }
+}
+
+/** 供 App 内部调用：刷新所有已添加的小组件 */
+suspend fun updateBalanceWidgets(context: Context) {
+    runCatching { BalanceWidget().updateAll(context) }
+}
+
+/* ---------- 界面 ---------- */
+
+@Composable
+private fun WidgetContent(data: WidgetData) {
+    Column(
+        modifier = GlanceModifier
+            .fillMaxSize()
+            .background(CardBg)
+            .cornerRadius(20.dp)
+            .padding(14.dp)
+            .clickable(actionStartActivity<MainActivity>()),
+        horizontalAlignment = Alignment.Horizontal.Start
+    ) {
+        when (data) {
+            is WidgetData.Ok -> {
+                val info = data.infos.firstOrNull()
+                Text("DeepSeek 余额", style = TextStyle(color = TitleColor, fontSize = 12.sp))
+                Spacer(GlanceModifier.height(2.dp))
+                Text(
+                    text = info?.let { "${it.totalBalance} ${it.currency}" } ?: "无余额数据",
+                    style = TextStyle(color = MainColor, fontSize = 26.sp, fontWeight = FontWeight.Bold),
+                    maxLines = 1
+                )
+                Spacer(GlanceModifier.height(4.dp))
+                Text(
+                    text = if (info != null) {
+                        "赠送 ${info.grantedBalance} · 充值 ${info.toppedUpBalance} · " +
+                            if (data.isAvailable) "可用" else "不可用"
+                    } else {
+                        if (data.isAvailable) "账户可用" else "账户不可用"
+                    },
+                    style = TextStyle(color = SubColor, fontSize = 12.sp),
+                    maxLines = 2
+                )
+                Text(
+                    "更新于 ${time(data.updatedAt)}",
+                    style = TextStyle(color = SubColor, fontSize = 11.sp)
+                )
+            }
+
+            WidgetData.NoKey -> {
+                Text("DeepSeek 余额", style = TextStyle(color = TitleColor, fontSize = 12.sp))
+                Spacer(GlanceModifier.height(2.dp))
+                Text(
+                    "未设置 API Key",
+                    style = TextStyle(color = MainColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                )
+                Text("点击此处打开 App 填写", style = TextStyle(color = SubColor, fontSize = 12.sp))
+            }
+
+            is WidgetData.Err -> {
+                Text("DeepSeek 余额", style = TextStyle(color = TitleColor, fontSize = 12.sp))
+                Spacer(GlanceModifier.height(2.dp))
+                Text(
+                    "获取失败",
+                    style = TextStyle(color = ErrColor, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                )
+                Text(
+                    data.message,
+                    style = TextStyle(color = SubColor, fontSize = 11.sp),
+                    maxLines = 2
+                )
+            }
+        }
+
+        Spacer(GlanceModifier.height(10.dp))
+        Text(
+            text = "刷新",
+            modifier = GlanceModifier
+                .background(AccentColor)
+                .cornerRadius(14.dp)
+                .padding(horizontal = 14.dp, vertical = 7.dp)
+                .clickable(actionRunCallback<RefreshAction>()),
+            style = TextStyle(color = OnAccent, fontSize = 13.sp)
+        )
+    }
+}
+EOF_WIDGET
+
+# ---------- CI：GitHub Actions 工作流 ----------
+
+wf ".github/workflows/build.yml" <<'EOF_WORKFLOW'
+name: Build APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project files
+        run: bash create_project.sh
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekBalance-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+EOF_WORKFLOW
+
+echo
+echo "✅ 全部生成完成，文件列表："
+(cd "$ROOT" && find . -type f -not -path "./.git/*" | sed 's|^\./||' | sort)
+echo
+echo "本地编译：在工程根目录执行  gradle assembleDebug"
+echo "产物路径：app/build/outputs/apk/debug/app-debug.apk"
+```
